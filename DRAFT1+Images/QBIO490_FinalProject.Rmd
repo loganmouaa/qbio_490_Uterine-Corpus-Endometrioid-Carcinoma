@@ -328,25 +328,176 @@ print(volcano_g2_vs_g1)
 ggsave("transcriptomic_volcano_G2_vs_G1.png", plot = volcano_g2_vs_g1, width = 10, height = 8)
 ```
 
+
+
+
 #4. Metyhlation
 #i tried so many times this doesnt run on my end, what about you guys....
-```{r}
-'''
+#OKAY NOW I'VE MADE IT
 
+```{r}
 # Query and download methylation data
 methyl_query <- GDCquery(
-  project      = "TCGA-UCEC",
+  project= "TCGA-UCEC",
   data.category = "DNA Methylation",
-  data.type     = "Methylation Beta Value",
-  platform      = "Illumina Human Methylation 450"
+  data.type = "Methylation Beta Value",
+  platform = "Illumina Human Methylation 450"
 )
 
 
 GDCdownload(methyl_query)
+```
+
+```{r}
+methyl_se <- GDCprepare(methyl_query)
+
+# Extract beta values and clinical data
+methyl_betas <- assay(methyl_se)
+methyl_clinical <- as.data.frame(colData(methyl_se))
+cpg_sites = as.data.frame(methyl_se@rowRanges@elementMetadata)
+
+print(paste("Methylation data dimensions:", dim(methyl_betas)[1], "probes x", dim(methyl_betas)[2], "samples"))
+
+write.csv(methyl_betas, "ucec_methylation_betas.csv")
+
+```
+```{r}
+methyl_clinical <- as.data.frame(colData(methyl_se))
+methyl_clinical <- methyl_clinical[, !sapply(methyl_clinical, is.list)]
+
+# Extract CpG annotation
+cpg_sites <- as.data.frame(methyl_se@rowRanges@elementMetadata)
+write.csv(cpg_sites, "ucec_cpg_sites.csv")
+```
+
+
+```{r}
+
+fix_patient12 <- function(x) {
+  x2 <- gsub("\\.", "-", x)
+  substr(x2, 1, 12)
+}
+
+methyl_patient <- fix_patient12(colnames(methyl_betas))
+
+clinic_clean$patient_short <- fix_patient12(clinic_clean$Tumor_Sample_Barcode)
+clinic_grade <- clinic_clean[!is.na(clinic_clean$neoplasm_histologic_grade), ]
+patient_to_grade <- setNames(clinic_grade$neoplasm_histologic_grade,
+                             clinic_grade$patient_short)
+
+# Add tumor grade to methylation clinical data
+methyl_clinical$tumor_grade <- patient_to_grade[methyl_patient]
+
+# samples withG1/G2/G3 grade
+keep_grade <- methyl_clinical$tumor_grade %in% c("G1", "G2", "G3") & !is.na(methyl_clinical$tumor_grade)
+methyl_clinical <- methyl_clinical[keep_grade, ]
+methyl_betas <- methyl_betas[, keep_grade]
+
+table(methyl_clinical$tumor_grade)
 
 ```
 
 
+```{r}
+#ow vs high grade: G1 vs G3
+grade_mask <- methyl_clinical$tumor_grade %in% c("G1", "G3")
+methyl_clinical_g13 <- methyl_clinical[grade_mask, ]
+betas_g13 <- methyl_betas[, grade_mask]
+
+methyl_clinical_g13$grade_binary <- ifelse(methyl_clinical_g13$tumor_grade == "G3",
+                                           "High", "Low")
+methyl_clinical_g13$grade_binary <- factor(methyl_clinical_g13$grade_binary,
+                                           levels = c("Low", "High"))
+
+betas_g13_clipped <- pmin(pmax(betas_g13, 1e-6), 1 - 1e-6)
+mval_g13 <- t(apply(betas_g13_clipped, 1, function(x) log2(x / (1 - x))))
+
+# matrix
+design <- model.matrix(~ grade_binary, data = methyl_clinical_g13)
+fit <- lmFit(mval_g13, design)
+fit2 <- eBayes(fit)
+
+coef_col <- colnames(fit$coefficients)[2]
 
 
+gene_col <- if ("gene_name" %in% colnames(cpg_sites)) {
+  "gene_name"
+} else if ("Gene_Symbol" %in% colnames(cpg_sites)) {
+  "Gene_Symbol"
+} else if ("gene" %in% colnames(cpg_sites)) {
+  "gene"
+} else if ("UCSC_RefGene_Name" %in% colnames(cpg_sites)) {
+  "UCSC_RefGene_Name"
+} else {
+  colnames(cpg_sites)[1]
+}
 
+# volcano
+dm_dat <- data.frame(
+  foldchange = fit$coefficients[, coef_col],
+  logPvalue  = -log10(p.adjust(fit2$p.value[, coef_col], method = "BY")),
+  geneName   = cpg_sites[[gene_col]]
+)
+
+dm_dat$signif <- with(dm_dat, abs(foldchange) > 1 & logPvalue > 2)
+
+cols <- c("TRUE"="blue", "FALSE"="grey")
+```
+```{r}
+methyl_volcano <- ggplot(dm_dat, aes(x = foldchange, y = logPvalue, color =signif)) +
+  geom_point(alpha = 0.3, size = 0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1,colour = "red", linetype = "dashed") +
+  geom_vline(xintercept = -1,colour = "red", linetype = "dashed") +
+  geom_hline(yintercept = 2,colour = "red", linetype = "dashed") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  xlab("M-value fold change (High vs Low grade)") +
+  ylab("-log10 adjusted p-value") +
+  ggtitle("Differential DNA Methylation: G3 vs G1 UCEC Tumors")
+
+print(methyl_volcano)
+ggsave("methylation_volcano_G3_vs_G1.png",
+       plot = methyl_volcano, width = 8, height = 6)
+```
+
+```{r}
+plot_methylation_box_by_grade <- function(gene_symbol,
+                                          betas_mat = betas_g13,
+                                          clin_df  = methyl_clinical_g13) {
+
+# CpGs annotated to this gene
+gene_mask <- !is.na(cpg_sites[[gene_col]]) &
+               grepl(paste0("\\b", gene_symbol, "\\b"),
+                     cpg_sites[[gene_col]])
+
+if(!any(gene_mask)) {
+    message("No CpG sites found for gene: ", gene_symbol)
+    return(NULL)}
+
+betas_gene <- betas_mat[gene_mask, , drop = FALSE]
+mean_beta  <- colMeans(betas_gene, na.rm = TRUE)
+
+df <- data.frame(
+  mean_beta   = mean_beta,
+  tumor_grade = clin_df$tumor_grade,
+  grade_group = clin_df$grade_binary)
+
+p <- ggplot(df, aes(x = tumor_grade, y = mean_beta, fill = tumor_grade)) +
+    geom_boxplot(alpha = 0.8) +
+    theme_bw() +
+    labs(title = paste0("Mean DNA Methylation in ",gene_symbol," by Tumor Grade"),
+    x = "Tumor Grade",y = "Mean Beta Value") +
+    theme(legend.position = "none")
+
+print(p)
+ggsave(paste0("methylation_boxplot_", gene_symbol, "_by_grade.png"),
+         plot = p, width = 6, height = 4)}
+
+# CCND2
+plot_methylation_box_by_grade("CCND2")
+
+#Example immune gene
+plot_methylation_box_by_grade("CD274")
+
+```
