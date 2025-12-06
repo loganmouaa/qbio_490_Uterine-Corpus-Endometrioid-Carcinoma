@@ -12,7 +12,7 @@ knitr::opts_knit$set(root.dir = output_dir)
 ```
 
 ```{r}
-#Load all required packages
+#packages
 if (!require("BiocManager", quietly = TRUE))
   install.packages("BiocManager")
 BiocManager::install(version = "3.21")
@@ -58,14 +58,13 @@ clin_query <- GDCquery(project = "TCGA-UCEC",
                        data.type = "Clinical Supplement", 
                        data.format = 'BCR Biotab')
 
-GDCdownload(clin_query)
+#GDCdownload(clin_query)
 clinical_data <- GDCprepare(clin_query)
 clinic <- clinical_data$clinical_patient_ucec[-c(1,2),]
 
-# Fix column names
 colnames(clinic)[colnames(clinic) == "bcr_patient_barcode"] <- "Tumor_Sample_Barcode"
 
-# Prepare survival data
+#clean survival data
 clinic$survival_time <- ifelse(clinic$last_contact_days_to == "[Not Available]" | 
                                is.na(clinic$last_contact_days_to),
                                clinic$death_days_to,
@@ -116,7 +115,7 @@ print(grade_dist_plot)
 ggsave("clinical_grade_distribution.png", plot = grade_dist_plot)
 ```
 
-#2. GENOMIC DATA - MAF
+#2 MAF
 ```{r}
 #Query and download mafmutation data
 maf_query <- GDCquery(project = "TCGA-UCEC",
@@ -125,7 +124,7 @@ maf_query <- GDCquery(project = "TCGA-UCEC",
                       workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking",
                       access = "open")
 
-GDCdownload(maf_query)
+#GDCdownload(maf_query)
 maf_data <- GDCprepare(maf_query)
 
 # Prepare clinical data for MAF
@@ -135,48 +134,135 @@ maf_object <- read.maf(maf = maf_data, clinicalData = clinic_maf, verbose = TRUE
 print(maf_object)
 ```
 
+
 ```{r}
-# Oncoplot -top 20
-png("genomic_oncoplot.png", width = 12, height = 8, units = "in", res = 300)
-oncoplot(maf = maf_object, top = 20, fontSize = 0.8)
-dev.off()
+# Check MAF object structure
+barcode_cols <- colnames(maf_object@data)[grepl("barcode|sample|tumor", 
+                                                colnames(maf_object@data), 
+                                                ignore.case = TRUE)]
 
-#Lollipop plots for key UCEC genes
+# Check if Tumor_Sample_Barcode existsor not
+if ("Tumor_Sample_Barcode" %in% colnames(maf_object@data)) {
 
-#PTEN
-pten_maf <- subsetMaf(maf = maf_object, genes = "PTEN", mafObj = TRUE)
+  maf_sample_ids <- unique(maf_object@data$Tumor_Sample_Barcode)
+  
+  # Extract patient IDs 
+  maf_patient_ids_short <- substr(maf_sample_ids, 1, 12)
+  
+  clinical_patient_ids <- substr(clinic_clean$Tumor_Sample_Barcode, 1, 12)
+  patient_to_grade <- setNames(clinic_clean$neoplasm_histologic_grade, 
+                               clinical_patient_ids)
+  
+  # grade mapping
+  maf_patient_grade <- patient_to_grade[maf_patient_ids_short]
+  
 
-png("genomic_PTEN_lollipop.png", width = 8, height = 6, units = "in", res = 300)
-lollipopPlot(maf = pten_maf, gene = "PTEN", AACol = "HGVSp_Short",
-             showMutationRate = FALSE, cBioPortal = FALSE)
-title("PTEN Mutations in UCEC", cex.main = 1.2)
-dev.off()
-
-#TP53
-tp53_maf <- subsetMaf(maf = maf_object, genes = "TP53", mafObj = TRUE)
-
-png("genomic_TP53_lollipop.png", width = 8, height = 6, units = "in", res = 300)
-lollipopPlot(maf = tp53_maf, gene = "TP53",
-             AACol = "HGVSp_Short",
-             showMutationRate = FALSE, cBioPortal = FALSE)
-title("TP53 Mutations in UCEC", cex.main = 1.2)
-dev.off()
-
-#CCNd
-ccnd2_maf <- subsetMaf(maf = maf_object, genes = "CCND2", mafObj = TRUE)
-
-png("genomic_CCND2_lollipop.png", width = 8, height = 6, units = "in", res = 300)
-lollipopPlot(maf = ccnd2_maf, gene = "CCND2",
-             AACol = "HGVSp_Short",
-             showMutationRate = FALSE, cBioPortal = FALSE)
-title("CCND2 Mutations in UCEC", cex.main = 1.2)
-dev.off()
-
-#Summary
-png("genomic_mutation_summary.png", width = 10, height = 8, units = "in", res = 300)
-plotmafSummary(maf = maf_object, rmOutlier = TRUE, addStat = 'median')
-dev.off()
+  new_clinical <- data.frame(
+    Tumor_Sample_Barcode = maf_sample_ids,
+    Tumor_Grade = maf_patient_grade,
+    stringsAsFactors = FALSE
+  )
+  
+  maf_object <- read.maf(maf = maf_data, 
+                         clinicalData = new_clinical, 
+                         verbose = FALSE)
+}
 ```
+
+```{r}
+
+if (!dir.exists("grade_specific")) {
+  dir.create("grade_specific")
+}
+
+
+grades <- c("G1", "G2", "G3")
+
+for (grade in grades) {
+  # Get samples for this grade
+  grade_samples <- maf_object@clinical.data$Tumor_Sample_Barcode[
+    maf_object@clinical.data$Tumor_Grade == grade & 
+      !is.na(maf_object@clinical.data$Tumor_Grade)
+  ]
+  
+  if (length(grade_samples) > 0) {
+
+    maf_grade <- subsetMaf(maf = maf_object, tsb = grade_samples)
+    
+    # Create oncoplot
+    png(paste0("grade_specific/grade_", grade, "_oncoplot.png"), 
+        width = 12, height = 8, units = "in", res = 300)
+    
+    unique_genes <- length(unique(maf_grade@data$Hugo_Symbol))
+    top_n <- min(20, unique_genes)
+    
+    oncoplot(maf = maf_grade, top = top_n, fontSize = 0.8)
+    
+    title(main = paste("UCEC Mutations - Grade", grade, 
+                       " (n =", length(grade_samples), ")"), 
+          cex.main = 1.2)
+    
+    dev.off()
+  }
+}
+
+# Create G3 lollipop plots for TP53 and CCND2
+g3_samples <- maf_object@clinical.data$Tumor_Sample_Barcode[
+  maf_object@clinical.data$Tumor_Grade == "G3" & 
+    !is.na(maf_object@clinical.data$Tumor_Grade)
+]
+
+if (length(g3_samples) > 0) {
+  maf_g3 <- subsetMaf(maf = maf_object, tsb = g3_samples)
+  
+  # TP53 lollipop
+  tp53_hotspots <- c(175, 213, 220, 248, 282)
+  
+  png("grade_specific/G3_TP53_lollipop_hotspots.png",
+      width = 10, height = 6, units = "in", res = 400)
+  
+  lollipopPlot(
+    maf = maf_g3,
+    gene = "TP53",
+    AACol = "HGVSp_Short",
+    showMutationRate = TRUE,
+    labelPos = tp53_hotspots,
+    repel = TRUE,
+    labPosSize = 0.7,
+    labPosAngle = 45,
+    pointSize = 1.3
+  )
+  
+  title(main = "TP53 Hotspot Mutations in UCEC Grade 3 Tumors",
+        cex.main = 1.2)
+  
+  dev.off()
+  
+  # CCND2 lollipop plot
+  png("grade_specific/G3_CCND2_lollipop.png",
+      width = 8, height = 4.5, units = "in", res = 400)
+  
+  lollipopPlot(
+    maf = maf_g3,
+    gene = "CCND2",
+    AACol = "HGVSp_Short",
+    showMutationRate = TRUE,
+    labelPos = "all",
+    repel = TRUE,
+    labPosSize = 0.7,
+    labPosAngle = 45,
+    pointSize = 1.3
+  )
+  
+  title(main = "CCND2 Mutations in UCEC Grade 3 Tumors", 
+        cex.main = 1.2)
+  
+  dev.off()
+}
+
+```
+
+
 
 #3. TRANSCRIPTOMIC DATA (RNA-seq)
 ```{r}
@@ -186,7 +272,7 @@ rna_query <- GDCquery(project = "TCGA-UCEC",
                       data.type = "Gene Expression Quantification", 
                       workflow.type = "STAR - Counts")
 
-GDCdownload(rna_query)
+#GDCdownload(rna_query)
 
 ```
 
@@ -214,8 +300,6 @@ clinic_grade_short <- clinic_grade$patient_short
 
 common_patients <- intersect(rna_patient, clinic_grade_short)
 ```
-
-
 
 
 ```{r}
@@ -259,8 +343,12 @@ print(dds)
 
 ```{r}
 # DESeq2
-
+#This part may show error or warning like: Error: attempt to use zero-length variable name (sometimes it does, and sometimes it doesn't)
+#but actually the next chunk do run for me
 dds <- DESeq(dds)
+```
+
+```{r}
 #different comparisons
 # G3 vs G1
 results_g3_vs_g1 <- results(dds, contrast = c("tumor_grade", "G3", "G1"))
@@ -291,6 +379,7 @@ print(paste("G3 vs G1 - significant genes (padj < 0.05):",
 print(paste("G2 vs G1 - significant genes (padj < 0.05):", 
             sum(results_g2_vs_g1_df$padj < 0.05, na.rm = TRUE)))
 ```
+
 ```{r}
 
 rna_genes <- as.data.frame(rowData(rna_se))
@@ -328,12 +417,7 @@ print(volcano_g2_vs_g1)
 ggsave("transcriptomic_volcano_G2_vs_G1.png", plot = volcano_g2_vs_g1, width = 10, height = 8)
 ```
 
-
-
-
 #4. Metyhlation
-#i tried so many times this doesnt run on my end, what about you guys....
-#OKAY NOW I'VE MADE IT
 
 ```{r}
 # Query and download methylation data
@@ -345,7 +429,7 @@ methyl_query <- GDCquery(
 )
 
 
-GDCdownload(methyl_query)
+#GDCdownload(methyl_query)
 ```
 
 ```{r}
@@ -361,6 +445,7 @@ print(paste("Methylation data dimensions:", dim(methyl_betas)[1], "probes x", di
 write.csv(methyl_betas, "ucec_methylation_betas.csv")
 
 ```
+
 ```{r}
 methyl_clinical <- as.data.frame(colData(methyl_se))
 methyl_clinical <- methyl_clinical[, !sapply(methyl_clinical, is.list)]
@@ -462,42 +547,73 @@ ggsave("methylation_volcano_G3_vs_G1.png",
 ```
 
 ```{r}
-plot_methylation_box_by_grade <- function(gene_symbol,
-                                          betas_mat = betas_g13,
-                                          clin_df  = methyl_clinical_g13) {
-
-# CpGs annotated to this gene
-gene_mask <- !is.na(cpg_sites[[gene_col]]) &
-               grepl(paste0("\\b", gene_symbol, "\\b"),
-                     cpg_sites[[gene_col]])
-
-if(!any(gene_mask)) {
+plot_methylation_box_by_grade <- function(
+  gene_symbol,
+  betas_mat = betas_g13,
+  clin_df  = methyl_clinical_g13
+) {
+  
+  # CpGs annotated to this gene
+  gene_mask <- !is.na(cpg_sites[[gene_col]]) &
+    grepl(paste0("\\b", gene_symbol, "\\b"), cpg_sites[[gene_col]])
+  
+  if(!any(gene_mask)) {
     message("No CpG sites found for gene: ", gene_symbol)
-    return(NULL)}
-
-betas_gene <- betas_mat[gene_mask, , drop = FALSE]
-mean_beta  <- colMeans(betas_gene, na.rm = TRUE)
-
-df <- data.frame(
-  mean_beta   = mean_beta,
-  tumor_grade = clin_df$tumor_grade,
-  grade_group = clin_df$grade_binary)
-
-p <- ggplot(df, aes(x = tumor_grade, y = mean_beta, fill = tumor_grade)) +
+    return(NULL)
+  }
+  
+  # subset betas
+  betas_gene <- betas_mat[gene_mask, , drop = FALSE]
+  mean_beta  <- colMeans(betas_gene, na.rm = TRUE)
+  
+  df <- data.frame(
+    mean_beta   = mean_beta,
+    tumor_grade = clin_df$tumor_grade
+  )
+  
+  # significant test
+  kw <- kruskal.test(mean_beta ~ tumor_grade, data = df)
+  pval <- kw$p.value
+  
+  # Short formatted p-value
+  ptxt <- ifelse(pval < 0.001, "p < 0.001", paste0("p = ", signif(pval, 3)))
+  
+  cat("\n===== ", gene_symbol, " Methylation Comparison by Grade =====\n")
+  print(kw)
+  cat("Formatted p-value:", ptxt, "\n\n")
+  
+  # ---- Plot ----
+  p <- ggplot(df, aes(x = tumor_grade, y = mean_beta, fill = tumor_grade)) +
     geom_boxplot(alpha = 0.8) +
     theme_bw() +
-    labs(title = paste0("Mean DNA Methylation in ",gene_symbol," by Tumor Grade"),
-    x = "Tumor Grade",y = "Mean Beta Value") +
+    labs(
+      title = paste0(
+        "Mean DNA Methylation in ", gene_symbol,
+        " by Tumor Grade\n", "Kruskal–Wallis: ", ptxt
+      ),
+      x = "Tumor Grade",
+      y = "Mean Beta Value"
+    ) +
     theme(legend.position = "none")
+  
+  print(p)
+  
+  # save
+  ggsave(
+    filename = paste0("methylation_boxplot_", gene_symbol, "_by_grade.png"),
+    plot = p, width = 6, height = 4
+  )
+  
+  return(invisible(list(
+    df = df,
+    test = kw,
+    pval = pval
+  )))
+}
 
-print(p)
-ggsave(paste0("methylation_boxplot_", gene_symbol, "_by_grade.png"),
-         plot = p, width = 6, height = 4)}
-
-# CCND2
+# Example:
 plot_methylation_box_by_grade("CCND2")
 
-#Example immune gene
-plot_methylation_box_by_grade("CD274")
-
 ```
+
+
